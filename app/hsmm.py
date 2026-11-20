@@ -256,6 +256,33 @@ def _forward_backward(emit: np.ndarray, model: _Model) -> tuple[np.ndarray, floa
     return gamma, log_likelihood
 
 
+def _prepare_inference(
+    power: list[float | None],
+    noise_std: float,
+    device1: DeviceParams,
+    device2: DeviceParams,
+    switch_probability: float,
+) -> tuple[np.ndarray, np.ndarray, _Model, np.ndarray, np.ndarray, float]:
+    """校验输入并完成前向-后向，返回 gamma、增强状态模型等中间结果。"""
+
+    if not power:
+        raise ValueError("power 序列不能为空")
+    t_total = len(power)
+    if t_total > 1440:
+        raise ValueError("观测序列最长为一天（1440 分钟）")
+    if not (noise_std > 0.0):
+        raise ValueError("noise_std 必须为正数")
+
+    raw = np.array(
+        [np.nan if v is None else float(v) for v in power], dtype=np.float64
+    )
+    missing = np.isnan(raw)
+    model = _build_model(device1, device2, switch_probability)
+    emit = _log_emission(raw, missing, model, float(noise_std))
+    gamma, log_likelihood = _forward_backward(emit, model)
+    return gamma, raw, model, missing, log_likelihood
+
+
 def infer_posterior(
     power: list[float | None],
     noise_std: float,
@@ -277,19 +304,10 @@ def infer_posterior(
     字典，包含 posterior_on（2 x T 后验概率）、missing、log_likelihood 等。
     """
 
-    if not power:
-        raise ValueError("power 序列不能为空")
-    t_total = len(power)
-    if t_total > 1440:
-        raise ValueError("观测序列最长为一天（1440 分钟）")
-
-    raw = np.array(
-        [np.nan if v is None else float(v) for v in power], dtype=np.float64
+    gamma, _raw, model, missing, log_likelihood = _prepare_inference(
+        power, noise_std, device1, device2, switch_probability
     )
-    missing = np.isnan(raw)
-    model = _build_model(device1, device2, switch_probability)
-    emit = _log_emission(raw, missing, model, float(noise_std))
-    gamma, log_likelihood = _forward_backward(emit, model)
+    t_total = len(power)
 
     posterior = np.exp(gamma)  # (T, S)
     # 数值清理后重新归一化，保证逐时刻概率和为 1。

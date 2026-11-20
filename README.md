@@ -1,8 +1,9 @@
-# 双设备开停时段推断服务
+# 双设备开停时段推断与错峰开机排程服务
 
 食堂值班员只有一块总电表，需要核对两台设备各自的开停时段。本服务接收
 **至多一天（1–1440 分钟）的逐分钟总功率**，用显式时长隐半马尔可夫模型
-（HSMM）联合推断两台设备的运行/停机/待核实时段。
+（HSMM）联合推断两台设备的运行/停机/待核实时段；并可在同一模型上为第三台
+**恒功率设备**选择线路功率超限风险可接受的最早开机分钟（`/schedule`）。
 
 ## 模型与判定口径
 
@@ -24,15 +25,39 @@
 - 当两台设备功率组合本身不可区分（结构性歧义）时，相关分钟会自然落入
   `uncertain`，不会给出武断结论。
 
+## 错峰开机排程（`/schedule`）
+
+沿用 `/infer` 的读数窗口与双设备模型参数，为第三台恒功率设备挑选开机分钟：
+
+- **起点**：以读数窗口**最后一分钟的增强状态联合后验** `(s1, s2, c1, c2)`
+  为初始分布，两台设备各自当前开/停状态已持续的分钟数原样保留，因此
+  “还要多久才允许翻转”不会被抹掉；两台设备之间也不做独立性近似。
+- **时间轴**：窗口结束后的下一分钟记为**第 1 分钟**，视野固定为接下来
+  **60 分钟**。候选时段 `[start, start + run_minutes - 1]` 必须完整落在
+  视野内（`start + run_minutes - 1 <= 60`），越界请求返回 422。
+- **未来演化**：不再有观测，只按原转移表（含最短开/停时长与翻转先验）滚动。
+  新设备从候选分钟起以恒定功率连续运行 `run_minutes` 分钟，其余分钟不计功率。
+- **超限判定**：每分钟用完整增强状态判定“两台已知设备 + 新设备”合计功率是否
+  `> line_power_limit`。超限的状态质量从存活分布中剔除且不再回流，
+  因此**同一条未来路径多次超限只计一次**；最终
+  `P(任一分钟超限) = 1 - 存活质量`。
+- **选点**：对所有候选计算上述概率，返回**最早**一个不超过
+  `max_exceedance_probability` 的开机分钟及其概率；全部不合格时返回
+  `found=false`、`start_minute=null`、`message="无可用时段"`。
+- **数值口径**：概率为对未来路径并集的无条件概率；响应中的
+  `exceedance_probability` 保留 6 位小数，而 `within_limit` 用未取整值判定，
+  避免四舍五入把轻微超限变成合格。
+
 ## 目录结构
 
 ```
 app/
   hsmm.py      # HSMM 状态空间、转移表、前向-后向、区间标注
+  scheduler.py # 末分钟增强状态后验滚动、超限并集概率、最早可行开机分钟
   schemas.py   # Pydantic 请求/响应模型与输入校验
-  main.py      # FastAPI 路由（/health、/infer、/docs）
-tests/         # 21 项 unittest 自测（模型性质 + 接口校验）
-examples/      # 请求样例与调用脚本
+  main.py      # FastAPI 路由（/health、/infer、/schedule、/docs）
+tests/         # 40 项 unittest 自测（模型性质 + 排程口径 + 接口校验）
+examples/      # 推断/排程请求样例与调用脚本
 Dockerfile
 docker-compose.yml
 ```
@@ -49,6 +74,7 @@ docker compose up --build
 - 交互式文档：`GET /docs`（Swagger UI）
 - OpenAPI Schema：`GET /openapi.json`
 - 推断接口：`POST /infer`
+- 排程接口：`POST /schedule`
 
 停止：`docker compose down`
 
@@ -87,6 +113,47 @@ python examples/call_example.py
   `[start_minute, end_minute)` 半开区间、`duration_minutes`、
   `missing_minutes`、`confidence`、`truncated`、`truncated_edges`；
 - `running_minutes` / `stopped_minutes` / `uncertain_minutes` 汇总。
+
+## 排程请求样例
+
+### curl
+
+```bash
+curl -s http://127.0.0.1:8000/schedule \
+  -H 'Content-Type: application/json' \
+  -d @examples/schedule_request.json | python -m json.tool
+```
+
+### Python
+
+```bash
+python examples/call_schedule_example.py
+```
+
+### 排程请求字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `power` / `noise_std` / `device1` / `device2` / `switch_probability` | 与 `/infer` 完全相同的读数窗口与双设备模型参数 |
+| `new_device_power` | 待排程恒功率设备功率，非负 |
+| `run_minutes` | 新设备连续运行分钟数，1–60 |
+| `candidate_start_minutes` | 候选开机分钟列表（1 起），每个时段须完整落在 60 分钟视野内 |
+| `line_power_limit` | 三台设备合计功率的线路功率上限 |
+| `max_exceedance_probability` | 可接受的“任一分钟超限”概率上限，0–1 |
+
+### 排程响应摘要
+
+- `found` / `start_minute` / `exceedance_probability` / `message`：最早可行
+  开机分钟及其超限概率；无可用时段时 `found=false`、前两者为 `null`、
+  `message="无可用时段"`。
+- `candidates`：所有候选按开机分钟升序，每项含 `start_minute`、
+  `end_minute`、`exceedance_probability`、`within_limit`。
+- `window_minutes` / `horizon_minutes` / `run_minutes` 等：回显本次计算口径。
+
+样例请求的读数窗口为 60 分钟，前 57 分钟两台设备均停机、最后 3 分钟抽风机
+（30 W）刚开机；新设备 15 W 运行 10 分钟、线路上限 40 W、可接受超限概率 0.7。
+实测返回 `found=true`、`start_minute=31`、`exceedance_probability=0.690185`，
+第 1/11/21 分钟的超限概率依次为 0.965083 / 0.767545 / 0.708005（均不合格）。
 
 ## 本地开发与自测（不使用 Docker）
 

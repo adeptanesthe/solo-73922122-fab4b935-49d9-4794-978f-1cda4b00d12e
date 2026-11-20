@@ -5,16 +5,33 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from .hsmm import DeviceParams, infer_posterior, label_intervals
-from .schemas import InferenceRequest, InferenceResponse
+from .scheduler import plan_schedule
+from .schemas import (
+    DeviceSpec,
+    InferenceRequest,
+    InferenceResponse,
+    ScheduleRequest,
+    ScheduleResponse,
+)
 
 app = FastAPI(
-    title="双设备开停时段推断服务",
+    title="双设备开停时段推断与错峰开机排程服务",
     description=(
         "根据一块电表的逐分钟总功率读数，用显式时长 HSMM 概率模型"
-        "联合推断两台设备各自的开机/停机/待核实时段。"
+        "联合推断两台设备各自的开机/停机/待核实时段；并可据此为第三台"
+        "恒功率设备选择线路功率超限风险可接受的最早开机分钟。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
+
+
+def _to_params(spec: DeviceSpec) -> DeviceParams:
+    return DeviceParams(
+        on_power=spec.on_power,
+        off_power=spec.off_power,
+        min_on=spec.min_on_minutes,
+        min_off=spec.min_off_minutes,
+    )
 
 
 @app.get("/health", tags=["运维"])
@@ -29,18 +46,8 @@ def health() -> dict:
     summary="推断两台设备的开停时段",
 )
 def infer(req: InferenceRequest) -> InferenceResponse:
-    device1 = DeviceParams(
-        on_power=req.device1.on_power,
-        off_power=req.device1.off_power,
-        min_on=req.device1.min_on_minutes,
-        min_off=req.device1.min_off_minutes,
-    )
-    device2 = DeviceParams(
-        on_power=req.device2.on_power,
-        off_power=req.device2.off_power,
-        min_on=req.device2.min_on_minutes,
-        min_off=req.device2.min_off_minutes,
-    )
+    device1 = _to_params(req.device1)
+    device2 = _to_params(req.device2)
 
     result = infer_posterior(
         power=req.power,
@@ -81,3 +88,25 @@ def infer(req: InferenceRequest) -> InferenceResponse:
         log_likelihood=result["log_likelihood"],
         devices=devices_out,
     )
+
+
+@app.post(
+    "/schedule",
+    response_model=ScheduleResponse,
+    tags=["排程"],
+    summary="为新设备选择超限风险可接受的最早开机分钟",
+)
+def schedule(req: ScheduleRequest) -> ScheduleResponse:
+    result = plan_schedule(
+        power=req.power,
+        noise_std=req.noise_std,
+        device1=_to_params(req.device1),
+        device2=_to_params(req.device2),
+        new_device_power=req.new_device_power,
+        run_minutes=req.run_minutes,
+        candidate_start_minutes=req.candidate_start_minutes,
+        line_power_limit=req.line_power_limit,
+        max_exceedance_probability=req.max_exceedance_probability,
+        switch_probability=req.switch_probability,
+    )
+    return ScheduleResponse(**result)
